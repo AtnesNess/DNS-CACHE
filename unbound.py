@@ -5,6 +5,71 @@ from struct import *
 import time
 
 
+class DNSPacket():
+    def __init__(self, data):
+        self._data = data
+        self._quest = None
+        self._ans = None
+        self._auth = None
+        self._add = None
+        self._name = None
+        self._nameLength = None
+        self.getNumbers()
+        self.getName()
+
+    def getData(self):
+
+        return self._data
+
+    def setTTL(self, ttl):
+        if self.getAnsSections() is None:
+            return
+        beginings, length = self.getAnsSections()
+        ansData = self._data[beginings[0]:beginings[-1]+length]
+        fmt = ">"+"HHHIHI"*self._ans
+        unpackedData = unpack(fmt, ansData)
+        packedData = list(unpackedData)
+        tmp = 0
+        for _ in range(self._ans):
+            tmp += 3
+            packedData[tmp] = ttl
+            tmp += 3
+
+        packedData = tuple(packedData)
+        self._data = self._data[:beginings[0]]+pack(fmt, *packedData)+self._data[beginings[-1]+length:]
+
+
+    def setID(self, ID):
+        data = self._data[:2]
+        packedID = pack("H", ID)
+        self._data = packedID + self._data[2:]
+
+
+    def getAnsSections(self):
+        if self._ans == 0:
+            return None
+        beginings = [12+self._nameLength+4+16*i for i in range(self._ans)]
+        return beginings, 16
+
+
+
+    def getNumbers(self):
+        self._quest, self._ans, self._auth, self._add = \
+                            unpack(">HHHH", self._data[4:12])
+
+        return self._quest, self._ans, self._auth, self._add
+
+    def getName(self):
+        name_length = 0
+        for i in self._data[12:]:
+            name_length += 1
+            if i == pack("b", 0):
+                break
+        self._nameLength = name_length
+        self._name = str(name_length)+"s", self._data[12:12+name_length]
+        return self._name
+
+
 class IP():
     def __init__(self, ip):
         if not isIP(ip):
@@ -19,11 +84,11 @@ class IP():
 
 
 class UnboundServer(object):
-    def __init__(self, ip):
-        if not isinstance(ip, IP):
-            raise AttributeError("ip should be an instance of IP class")
+    def __init__(self, port):
+        if not isinstance(port, int):
+            raise AttributeError("port should be an instance of INT")
         self._sock = socket(AF_INET, SOCK_DGRAM)
-        self._sock.bind((ip.getIPString(), 53))
+        self._sock.bind(("", port))
         self._sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
         self._cache = {}
         self._ttl = 86400
@@ -53,16 +118,19 @@ class UnboundServer(object):
         forward_sock.settimeout(0.1)
         try:
             while True:
-                data, addr = self._sock.recvfrom(1024)
-                unpacked_data = unpack("HHHHHH"+str(len(data)-6*2-4)+"s"+"HH", data)
-                key = unpacked_data[1:]
+                data, addr = self._sock.recvfrom(2048)
+                request = DNSPacket(data)
+                packed_data = request.getData()
+                key = packed_data[2:]
                 if key in self._cache:
                     cache_data = self._cache[key][0]
                     cache_time = self._cache[key][1]
                     if time.time() - cache_time <= self._ttl:
-                        unpacked_cache = unpack("HHHHHH"+str(len(cache_data)-6*2-4)+"s"+"HH", cache_data)
-                        self._sock.sendto(pack("HHHHHH"+str(len(cache_data)-6*2-4)+"s"+"HH", unpacked_data[0],
-                                               *unpacked_cache[1:]), addr)
+                        reply = DNSPacket(cache_data)
+                        reply.setTTL(self._ttl - time.time() + cache_time)
+                        reply.setID(unpack("H", packed_data[0:2])[0])
+                        print("cached")
+                        self._sock.sendto(reply.getData(), addr)
                         continue
                 response = None
                 for forwarder in self._forwarders:
@@ -73,10 +141,13 @@ class UnboundServer(object):
                             break
                     except timeout:
                         pass
-
                 if response is None:
                     print ("No response...")
                     continue
+                print("forward")
+                response_packet = DNSPacket(response)
+                response_packet.setTTL(self._ttl)
+                response = response_packet.getData()
                 self._cache[key] = [response, time.time()]
                 self._sock.sendto(response, addr)
         finally:
@@ -92,19 +163,21 @@ def isIP(adr):
 
 
 def main(args):
-    serv_addr = IP(args.address)
-    server = UnboundServer(serv_addr)
+    serv_port = args.port
+    server = UnboundServer(serv_port)
     if args.ttl:
         server.ttl = args.ttl
 
     if args.forwarders:
         server.forwarders = args.forwarders
+    else:
+        server.forwarders.append(IP("8.8.8.8"))
 
     server.start()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Unbound-like server")
-    parser.add_argument("address", help="dns-server address")
+    parser.add_argument("port", help="dns-server port", type=int)
     parser.add_argument("-f", "--forwarders", metavar="F", nargs="+", help="dns-server address")
     parser.add_argument("-t", "--ttl", help="set TTL to cache")
     args = parser.parse_args()
